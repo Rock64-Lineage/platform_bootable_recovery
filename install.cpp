@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <setjmp.h>
 
 #include <chrono>
 #include <limits>
@@ -47,6 +48,8 @@
 #include "roots.h"
 #include "ui.h"
 #include "verifier.h"
+
+#include "cutils/properties.h"
 
 extern RecoveryUI* ui;
 extern bool bWipeAfterUpdate;
@@ -297,6 +300,12 @@ update_binary_command(const char* path, ZipArchive* zip, int retry_count,
 }
 #endif  // !AB_OTA_UPDATER
 
+static jmp_buf jb;
+static void sig_bus(int sig)
+{
+    longjmp(jb, 1);
+}
+
 // If the package contains an update binary, extract it and run it.
 static int
 try_update_binary(const char* path, ZipArchive* zip, bool* wipe_cache,
@@ -450,7 +459,12 @@ try_update_binary(const char* path, ZipArchive* zip, bool* wipe_cache,
         return INSTALL_RETRY;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        LOGE("Error in %s\n(Status %d)\n", path, WEXITSTATUS(status));
+        if (WEXITSTATUS(status) != 7) {
+           LOGE("Installation error in %s\n(Status %d)\n", path, WEXITSTATUS(status));
+        } else {
+           LOGE("Failed to install %s\n", path);
+           LOGE("Please take note of all the above lines for reports\n");
+        }
         return INSTALL_ERROR;
     }
 
@@ -461,11 +475,34 @@ static int
 really_install_package(const char *path, bool* wipe_cache, bool needs_mount,
                        std::vector<std::string>& log_buffer, int retry_count)
 {
+    int ret = 0;
+
     ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
     ui->Print("Finding update package...\n");
     // Give verification half the progress bar...
     ui->SetProgressType(RecoveryUI::DETERMINATE);
     ui->ShowProgress(VERIFICATION_PROGRESS_FRACTION, VERIFICATION_PROGRESS_TIME);
+
+    // Resolve symlink in case legacy /sdcard path is used
+    // Requires: symlink uses absolute path
+    char new_path[PATH_MAX];
+    if (strlen(path) > 1) {
+        char *rest = strchr(path + 1, '/');
+        if (rest != NULL) {
+            int readlink_length;
+            int root_length = rest - path;
+            char *root = (char *)malloc(root_length + 1);
+            strncpy(root, path, root_length);
+            root[root_length] = 0;
+            readlink_length = readlink(root, new_path, PATH_MAX);
+            if (readlink_length > 0) {
+                strncpy(new_path + readlink_length, rest, PATH_MAX - readlink_length);
+                path = new_path;
+            }
+            free(root);
+        }
+    }
+
     LOGI("Update location: %s\n", path);
 
     // Map the update package into memory.
@@ -476,6 +513,7 @@ really_install_package(const char *path, bool* wipe_cache, bool needs_mount,
             ensure_path_mounted(path+1);
         } else {
             ensure_path_mounted(path);
+            remount_no_selinux(path);
         }
     }
 
@@ -485,10 +523,13 @@ really_install_package(const char *path, bool* wipe_cache, bool needs_mount,
         return INSTALL_CORRUPT;
     }
 
+    set_perf_mode(true);
+
     // Verify package.
     if (!verify_package(map.addr, map.length)) {
         log_buffer.push_back(android::base::StringPrintf("error: %d", kZipVerificationFailure));
         sysReleaseMap(&map);
+        set_perf_mode(false);
         return INSTALL_CORRUPT;
     }
 
@@ -500,6 +541,7 @@ really_install_package(const char *path, bool* wipe_cache, bool needs_mount,
         log_buffer.push_back(android::base::StringPrintf("error: %d", kZipOpenFailure));
 
         sysReleaseMap(&map);
+        set_perf_mode(false);
         return INSTALL_CORRUPT;
     }
 
@@ -509,13 +551,14 @@ really_install_package(const char *path, bool* wipe_cache, bool needs_mount,
         ui->Print("Retry attempt: %d\n", retry_count);
     }
     ui->SetEnableReboot(false);
-    int result = try_update_binary(path, &zip, wipe_cache, log_buffer, retry_count);
+    ret = try_update_binary(path, &zip, wipe_cache, log_buffer, retry_count);
     ui->SetEnableReboot(true);
     ui->Print("\n");
 
     sysReleaseMap(&map);
 
-    return result;
+    set_perf_mode(false);
+    return ret;
 }
 
 int
@@ -581,13 +624,29 @@ bool verify_package(const unsigned char* package_data, size_t package_size) {
     // Verify package.
     ui->Print("Verifying update package...\n");
     auto t0 = std::chrono::system_clock::now();
-    int err = verify_file(const_cast<unsigned char*>(package_data), package_size, loadedKeys);
-    std::chrono::duration<double> duration = std::chrono::system_clock::now() - t0;
-    ui->Print("Update package verification took %.1f s (result %d).\n", duration.count(), err);
+    int err;
+
+    // Because we mmap() the update file which is backed by FUSE, we get
+    // SIGBUS when the host aborts the transfer.  We handle this by using
+    // setjmp/longjmp.
+    signal(SIGBUS, sig_bus);
+    if (setjmp(jb) == 0) {
+        err = verify_file(const_cast<unsigned char*>(package_data), package_size, loadedKeys);
+        std::chrono::duration<double> duration = std::chrono::system_clock::now() - t0;
+        ui->Print("Update package verification took %.1f s (result %d).\n", duration.count(), err);
+    } else {
+        err = VERIFY_FAILURE;
+    }
+    signal(SIGBUS, SIG_DFL);
     if (err != VERIFY_SUCCESS) {
         LOGE("Signature verification failed\n");
         LOGE("error: %d\n", kZipVerificationFailure);
         return false;
     }
     return true;
+}
+
+void
+set_perf_mode(bool enable) {
+    property_set("recovery.perf.mode", enable ? "1" : "0");
 }

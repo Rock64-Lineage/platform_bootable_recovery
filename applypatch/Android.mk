@@ -30,7 +30,7 @@ include $(CLEAR_VARS)
 LOCAL_CLANG := true
 LOCAL_SRC_FILES := bspatch.cpp imgpatch.cpp utils.cpp
 LOCAL_MODULE := libimgpatch
-LOCAL_C_INCLUDES += bootable/recovery
+LOCAL_C_INCLUDES += $(call project-path-for,recovery)
 LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)/include
 LOCAL_STATIC_LIBRARIES += libcrypto_static libbz libz
 
@@ -42,7 +42,7 @@ include $(CLEAR_VARS)
 LOCAL_CLANG := true
 LOCAL_SRC_FILES := bspatch.cpp imgpatch.cpp utils.cpp
 LOCAL_MODULE := libimgpatch
-LOCAL_C_INCLUDES += bootable/recovery
+LOCAL_C_INCLUDES += $(call project-path-for,recovery)
 LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)/include
 LOCAL_STATIC_LIBRARIES += libcrypto_static libbz libz
 
@@ -54,8 +54,11 @@ include $(CLEAR_VARS)
 LOCAL_CLANG := true
 LOCAL_SRC_FILES := main.cpp
 LOCAL_MODULE := applypatch
+
 LOCAL_C_INCLUDES += bootable/recovery
-LOCAL_STATIC_LIBRARIES += libapplypatch libbase libotafault libmtdutils librk_emmcutils libfs_mgr libcrypto_static libbz \
+LOCAL_STATIC_LIBRARIES += libapplypatch libbase libotafault libmtdutils librk_emmcutils \
+                          libfs_mgr \
+                          libcrypto_static libbz \
                           libedify \
 
 LOCAL_SHARED_LIBRARIES += libz libcutils libc

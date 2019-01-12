@@ -33,6 +33,7 @@
 #include <sys/xattr.h>
 #include <linux/xattr.h>
 #include <inttypes.h>
+#include <blkid/blkid.h>
 
 #include <memory>
 #include <string>
@@ -59,13 +60,11 @@
 #include "install.h"
 #include "tune2fs.h"
 #include "emmcutils/rk_emmcutils.h"
-
 #include "rkupdate/Upgrade.h"
 
 #ifdef USE_EXT4
 #include "make_ext4fs.h"
 #include "wipe.h"
-#endif
 
 extern char* g_package_file;
 
@@ -370,7 +369,6 @@ Value* FormatFn(const char* name, State* state, int argc, Expr* argv[]) {
             goto done;
         }
         result = location;
-#ifdef USE_EXT4
     } else if (strcmp(fs_type, "ext4") == 0) {
         int status = make_ext4fs(device, atoll(fs_size), mount_point, sehandle);
         if (status != 0) {
@@ -398,7 +396,6 @@ Value* FormatFn(const char* name, State* state, int argc, Expr* argv[]) {
             goto done;
         }
         result = location;
-#endif
     } else {
         printf("%s: unsupported fs_type \"%s\" partition_type \"%s\"",
                 name, fs_type, partition_type);
@@ -1714,10 +1711,11 @@ Value* WriteValueFn(const char* name, State* state, int argc, Expr* argv[]) {
 // current package (because nothing has cleared the copy of the
 // arguments stored in the BCB).
 //
-// The argument is the partition name passed to the android reboot
-// property.  It can be "recovery" to boot from the recovery
-// partition, or "" (empty string) to boot from the regular boot
-// partition.
+// The first argument is the block device for the misc partition
+// ("/misc" in the fstab).  The second argument is the argument
+// passed to the android reboot property.  It can be "recovery" to
+// boot from the recovery partition, or "" (empty string) to boot
+// from the regular boot partition.
 Value* RebootNowFn(const char* name, State* state, int argc, Expr* argv[]) {
     if (argc != 2) {
         return ErrorAbort(state, kArgsParsingFailure, "%s() expects 2 args, got %d", name, argc);
@@ -1733,6 +1731,7 @@ Value* RebootNowFn(const char* name, State* state, int argc, Expr* argv[]) {
     memset(buffer, 0, sizeof(((struct bootloader_message*)0)->command));
     FILE* f = fopen(filename, "r+b");
     fseek(f, offsetof(struct bootloader_message, command), SEEK_SET);
+    fseek(f, BOOTLOADER_MESSAGE_OFFSET_IN_MISC, SEEK_CUR);
     ota_fwrite(buffer, sizeof(((struct bootloader_message*)0)->command), 1, f);
     fclose(f);
     free(filename);
@@ -1743,6 +1742,11 @@ Value* RebootNowFn(const char* name, State* state, int argc, Expr* argv[]) {
     }
 
     property_set(ANDROID_RB_PROPERTY, buffer);
+
+    sleep(5);
+    // Attempt to reboot using older methods in case the recovery
+    // that we are updating does not support init reboots
+    android_reboot(ANDROID_RB_RESTART, 0, 0);
 
     sleep(5);
     free(property);
@@ -1775,6 +1779,7 @@ Value* SetStageFn(const char* name, State* state, int argc, Expr* argv[]) {
     // package installation.
     FILE* f = fopen(filename, "r+b");
     fseek(f, offsetof(struct bootloader_message, stage), SEEK_SET);
+    fseek(f, BOOTLOADER_MESSAGE_OFFSET_IN_MISC, SEEK_CUR);
     int to_write = strlen(stagestr)+1;
     int max_size = sizeof(((struct bootloader_message*)0)->stage);
     if (to_write > max_size) {
@@ -1801,6 +1806,7 @@ Value* GetStageFn(const char* name, State* state, int argc, Expr* argv[]) {
     char buffer[sizeof(((struct bootloader_message*)0)->stage)];
     FILE* f = fopen(filename, "rb");
     fseek(f, offsetof(struct bootloader_message, stage), SEEK_SET);
+    fseek(f, BOOTLOADER_MESSAGE_OFFSET_IN_MISC, SEEK_CUR);
     ota_fread(buffer, sizeof(buffer), 1, f);
     fclose(f);
     buffer[sizeof(buffer)-1] = '\0';

@@ -19,9 +19,13 @@
 
 #include "ui.h"
 
-class Device {
+#include <stack>
+
+struct menu;
+
+class Device : public VoldWatcher {
   public:
-    Device(RecoveryUI* ui) : ui_(ui) { }
+    explicit Device(RecoveryUI* ui);
     virtual ~Device() { }
 
     // Called to obtain the UI object that should be used to display
@@ -57,18 +61,19 @@ class Device {
     virtual int HandleMenuKey(int key, int visible);
 
     enum BuiltinAction {
-        NO_ACTION = 0,
-        REBOOT = 1,
-        APPLY_SDCARD = 2,
-        // APPLY_CACHE was 3.
-        APPLY_ADB_SIDELOAD = 4,
-        WIPE_DATA = 5,
-        WIPE_CACHE = 6,
-        REBOOT_BOOTLOADER = 7,
-        SHUTDOWN = 8,
-        VIEW_RECOVERY_LOGS = 9,
-        MOUNT_SYSTEM = 10,
-        RUN_GRAPHICS_TEST = 11,
+        NO_ACTION,
+        REBOOT,
+        APPLY_UPDATE,
+        WIPE_DATA,
+        WIPE_FULL,
+        WIPE_CACHE,
+        REBOOT_RECOVERY,
+        REBOOT_BOOTLOADER,
+        SHUTDOWN,
+        VIEW_RECOVERY_LOGS,
+        MOUNT_SYSTEM,
+        RUN_GRAPHICS_TEST,
+        WIPE_SYSTEM,
     };
 
     // Return the list of menu items (an array of strings,
@@ -91,6 +96,8 @@ class Device {
     static const int kHighlightUp = -2;
     static const int kHighlightDown = -3;
     static const int kInvokeItem = -4;
+    static const int kGoBack = -5;
+    static const int kRefresh = -6;
 
     // Called before and after we do a wipe data/factory reset operation,
     // either via a reboot from the main system with the --wipe_data flag,
@@ -103,8 +110,18 @@ class Device {
     virtual bool PreWipeData() { return true; }
     virtual bool PostWipeData() { return true; }
 
+    virtual bool PreWipeMedia() { return true; }
+    virtual bool PostWipeMedia() { return true; }
+
+    // Called before reboot
+    virtual char const* GetRebootReason() { return ""; }
+
+    virtual void onVolumeChanged() { ui_->onVolumeChanged(); }
+
   private:
     RecoveryUI* ui_;
+
+    std::stack<const menu*> menu_stack;
 };
 
 // The device-specific library must define this function (or the

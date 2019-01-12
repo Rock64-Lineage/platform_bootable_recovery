@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 #include <fs_mgr.h>
 #include "mtdutils/mtdutils.h"
@@ -35,9 +36,52 @@
 #include "emmcutils/rk_emmcutils.h"
 
 
+#include "voldclient.h"
+#include <blkid/blkid.h>
+
 static struct fstab *fstab = NULL;
 
 extern struct selabel_handle *sehandle;
+
+static int mkdir_p(const char* path, mode_t mode)
+{
+    char dir[PATH_MAX];
+    char* p;
+    strcpy(dir, path);
+    for (p = strchr(&dir[1], '/'); p != NULL; p = strchr(p+1, '/')) {
+        *p = '\0';
+        if (mkdir(dir, mode) != 0 && errno != EEXIST) {
+            return -1;
+        }
+        *p = '/';
+    }
+    if (mkdir(dir, mode) != 0 && errno != EEXIST) {
+        return -1;
+    }
+    return 0;
+}
+
+static void write_fstab_entry(Volume *v, FILE *file)
+{
+    if (NULL != v && strcmp(v->fs_type, "mtd") != 0 && strcmp(v->fs_type, "emmc") != 0
+                  && strcmp(v->fs_type, "bml") != 0 && !fs_mgr_is_voldmanaged(v)
+                  && strncmp(v->blk_device, "/", 1) == 0
+                  && strncmp(v->mount_point, "/", 1) == 0) {
+
+        fprintf(file, "%s ", v->blk_device);
+        fprintf(file, "%s ", v->mount_point);
+        fprintf(file, "%s ", v->fs_type);
+        fprintf(file, "%s 0 0\n", v->fs_options == NULL ? "defaults" : v->fs_options);
+    }
+}
+
+int get_num_volumes() {
+    return fstab->num_entries;
+}
+
+Volume* get_device_volumes() {
+    return fstab->recs;
+}
 
 void load_volume_table()
 {
@@ -74,22 +118,84 @@ void load_volume_table()
         return;
     }
 
+    // Create a boring /etc/fstab so tools like Busybox work
+    FILE *file = fopen("/etc/fstab", "w");
+    if (file == NULL) {
+        LOGW("Unable to create /etc/fstab!\n");
+        return;
+    }
+
     printf("recovery filesystem table\n");
     printf("=========================\n");
     for (i = 0; i < fstab->num_entries; ++i) {
         Volume* v = &fstab->recs[i];
         printf("  %d %s %s %s %lld\n", i, v->mount_point, v->fs_type,
                v->blk_device, v->length);
+
+        write_fstab_entry(v, file);
     }
+
+    fclose(file);
+
     printf("\n");
 }
 
+bool volume_is_mountable(Volume *v)
+{
+    return (fs_mgr_is_voldmanaged(v) ||
+            !strcmp(v->fs_type, "yaffs2") ||
+            !strcmp(v->fs_type, "ext4") ||
+            !strcmp(v->fs_type, "f2fs") ||
+            !strcmp(v->fs_type, "vfat"));
+}
+
+bool volume_is_readonly(Volume *v)
+{
+    return (v->flags & MS_RDONLY);
+}
+
+bool volume_is_verity(Volume *v)
+{
+    return fs_mgr_is_verified(v);
+}
+
 Volume* volume_for_path(const char* path) {
-    return fs_mgr_get_entry_for_mount_point(fstab, path);
+    Volume *rec = fs_mgr_get_entry_for_mount_point(fstab, path);
+
+    if (rec == NULL)
+        return rec;
+
+    if (strcmp(rec->fs_type, "ext4") == 0 || strcmp(rec->fs_type, "f2fs") == 0 ||
+            strcmp(rec->fs_type, "vfat") == 0) {
+        char *detected_fs_type = blkid_get_tag_value(NULL, "TYPE", rec->blk_device);
+
+        if (detected_fs_type == NULL)
+            return rec;
+
+        Volume *fetched_rec = rec;
+        while (rec != NULL && strcmp(rec->fs_type, detected_fs_type) != 0)
+            rec = fs_mgr_get_entry_for_mount_point_after(rec, fstab, path);
+
+        if (rec == NULL)
+            return fetched_rec;
+    }
+
+    return rec;
+}
+
+Volume* volume_for_label(const char* label) {
+    int i;
+    for (i = 0; i < get_num_volumes(); i++) {
+        Volume* v = get_device_volumes() + i;
+        if (v->label && !strcmp(v->label, label)) {
+            return v;
+        }
+    }
+    return NULL;
 }
 
 // Mount the volume specified by path at the given mount_point.
-int ensure_path_mounted_at(const char* path, const char* mount_point) {
+int ensure_path_mounted_at(const char* path, const char* mount_point, bool force_rw) {
     Volume* v = volume_for_path(path);
     if (v == NULL) {
         LOGE("unknown volume for path [%s]\n", path);
@@ -111,14 +217,16 @@ int ensure_path_mounted_at(const char* path, const char* mount_point) {
         mount_point = v->mount_point;
     }
 
-    const MountedVolume* mv =
-        find_mounted_volume_by_mount_point(mount_point);
-    if (mv) {
-        // volume is already mounted
-        return 0;
+    if (!fs_mgr_is_voldmanaged(v)) {
+        const MountedVolume* mv =
+            find_mounted_volume_by_mount_point(mount_point);
+        if (mv) {
+            // volume is already mounted
+            return 0;
+        }
     }
 
-    mkdir(mount_point, 0755);  // in case it doesn't already exist
+    mkdir_p(mount_point, 0755);  // in case it doesn't already exist
 
     if (strcmp(v->fs_type, "yaffs2") == 0) {
         // mount an MTD partition as a YAFFS2 filesystem.
@@ -132,10 +240,17 @@ int ensure_path_mounted_at(const char* path, const char* mount_point) {
         }
         return mtd_mount_partition(partition, mount_point, v->fs_type, 0);
     } else if (strcmp(v->fs_type, "ext4") == 0 ||
-    		   strcmp(v->fs_type, "f2fs") == 0 ||
+               strcmp(v->fs_type, "f2fs") == 0 ||
                strcmp(v->fs_type, "squashfs") == 0) {
+        unsigned long mntflags = v->flags;
+        if (!force_rw) {
+            if ((v->flags & MS_RDONLY) || fs_mgr_is_verified(v)) {
+                mntflags |= MS_RDONLY;
+            }
+        }
+
         result = mount(v->blk_device, mount_point, v->fs_type,
-                       v->flags, v->fs_options);
+                       mntflags, v->fs_options);
         if (result == 0) return 0;
 
         LOGE("failed to mount %s (%s)\n", mount_point, strerror(errno));
@@ -179,14 +294,76 @@ int ensure_path_mounted(const char* path) {
         printf("the path is already mounted!\n");
         return 0;
     }
-    // Mount at the default mount point.
-    return ensure_path_mounted_at(path, nullptr);
 }
 
-int ensure_path_unmounted(const char* path) {
-    Volume* v = volume_for_path(path);
+int ensure_volume_mounted(Volume* v, bool force_rw) {
+    if (v == NULL) {
+        LOGE("cannot mount unknown volume\n");
+        return -1;
+    }
+    return ensure_path_mounted_at(v->mount_point, nullptr, force_rw);
+}
+
+int remount_no_selinux(const char* path) {
+    int ret;
+
+    char *old_fs_options;
+    char *new_fs_options;
+
+    char se_context[] = ",context=u:object_r:app_data_file:s0";
+    Volume *v;
+
+    // Backup original mount options
+    v = volume_for_path(path);
+    old_fs_options = v->fs_options;
+
+    // Add SELinux mount override
+    asprintf(&new_fs_options, "%s%s", v->fs_options, se_context);
+    v->fs_options = new_fs_options;
+
+    ensure_path_unmounted(path);
+    ret = ensure_path_mounted(path);
+
+    // Restore original mount options
+    v->fs_options = old_fs_options;
+    free(new_fs_options);
+
+    return ret;
+}
+
+int ensure_path_mounted(const char* path, bool force_rw) {
+    // Mount at the default mount point.
+    return ensure_path_mounted_at(path, nullptr, force_rw);
+}
+
+int ensure_path_unmounted(const char* path, bool detach /* = false */) {
+    Volume* v;
+    if (memcmp(path, "/storage/", 9) == 0) {
+        char label[PATH_MAX];
+        const char* p = path+9;
+        const char* q = strchr(p, '/');
+        memset(label, 0, sizeof(label));
+        if (q) {
+            memcpy(label, p, q-p);
+        }
+        else {
+            strcpy(label, p);
+        }
+        v = volume_for_label(label);
+    }
+    else {
+        v = volume_for_path(path);
+    }
     if (v == NULL) {
         LOGE("unknown volume for path [%s]\n", path);
+        return -1;
+    }
+    return ensure_volume_unmounted(v, detach);
+}
+
+int ensure_volume_unmounted(Volume* v, bool detach /* = false */) {
+    if (v == NULL) {
+        LOGE("cannot unmount unknown volume\n");
         return -1;
     }
     if (strcmp(v->fs_type, "ramdisk") == 0) {
@@ -208,7 +385,14 @@ int ensure_path_unmounted(const char* path) {
         return 0;
     }
 
-    return unmount_mounted_volume(mv);
+    if (detach) {
+        result = unmount_mounted_volume_detach(mv);
+    }
+    else {
+        result = unmount_mounted_volume(mv);
+    }
+
+    return result;
 }
 
 static int exec_cmd(const char* path, char* const argv[]) {
@@ -267,8 +451,60 @@ int run(const char *filename, char *const argv[])
     return 0;
 }
 
-int format_volume(const char* volume, const char* directory) {
+static int rmtree_except(const char* path, const char* except)
+{
+    char pathbuf[PATH_MAX];
+    int rc = 0;
+    DIR* dp = opendir(path);
+    if (dp == NULL) {
+        return -1;
+    }
+    struct dirent* de;
+    while ((de = readdir(dp)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (except && !strcmp(de->d_name, except))
+            continue;
+        struct stat st;
+        snprintf(pathbuf, sizeof(pathbuf), "%s/%s", path, de->d_name);
+        rc = lstat(pathbuf, &st);
+        if (rc != 0) {
+            LOGE("Failed to stat %s\n", pathbuf);
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            rc = rmtree_except(pathbuf, NULL);
+            if (rc != 0)
+                break;
+            rc = rmdir(pathbuf);
+        }
+        else {
+            rc = unlink(pathbuf);
+        }
+        if (rc != 0) {
+            LOGI("Failed to remove %s: %s\n", pathbuf, strerror(errno));
+            break;
+        }
+    }
+    closedir(dp);
+    return rc;
+}
 
+int format_volume(const char* volume, const char* directory, bool force) {
+    if (strcmp(volume, "media") == 0) {
+        if (!vdc->isEmulatedStorage()) {
+            return 0;
+        }
+        if (ensure_path_mounted("/data") != 0) {
+            LOGE("format_volume failed to mount /data\n");
+            return -1;
+        }
+        remount_no_selinux("/data");
+        int rc = 0;
+        rc = rmtree_except("/data/media", NULL);
+        ensure_path_unmounted("/data");
+        return rc;
+    }
 
     Volume* v = volume_for_path(volume);
     if (v == NULL) {
@@ -285,8 +521,49 @@ int format_volume(const char* volume, const char* directory) {
         return -1;
     }
 
+    if (!force && strcmp(volume, "/data") == 0 && vdc->isEmulatedStorage()) {
+        if (ensure_path_mounted("/data") == 0) {
+            remount_no_selinux("/data");
+            // Preserve .layout_version to avoid "nesting bug"
+            LOGI("Preserving layout version\n");
+            unsigned char layout_buf[256];
+            ssize_t layout_buflen = -1;
+            int fd;
+            fd = open("/data/.layout_version", O_RDONLY);
+            if (fd != -1) {
+                layout_buflen = read(fd, layout_buf, sizeof(layout_buf));
+                close(fd);
+            }
+
+            int rc = rmtree_except("/data", "media");
+
+            // Restore .layout_version
+            if (layout_buflen > 0) {
+                LOGI("Restoring layout version\n");
+                fd = open("/data/.layout_version", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (fd != -1) {
+                    write(fd, layout_buf, layout_buflen);
+                    close(fd);
+                }
+            }
+
+            ensure_path_unmounted(volume);
+
+            return rc;
+        }
+        else {
+            LOGE("format_volume failed to mount /data\n");
+            return -1;
+        }
+    }
+
     if (ensure_path_unmounted(volume) != 0) {
         LOGE("format_volume failed to unmount \"%s\"\n", v->mount_point);
+        return -1;
+    }
+
+    if (fs_mgr_is_voldmanaged(v)) {
+        LOGE("can't format vold volume \"%s\"", volume);
         return -1;
     }
 
@@ -347,24 +624,24 @@ int format_volume(const char* volume, const char* directory) {
                 }
             }
         } else {   /* Has to be f2fs because we checked earlier. */
-            if (v->key_loc != NULL && strcmp(v->key_loc, "footer") == 0 && length < 0) {
-                LOGE("format_volume: crypt footer + negative length (%zd) not supported on %s\n", length, v->fs_type);
-                return -1;
-            }
+            char bytes_reserved[20], num_sectors[20];
+            const char* f2fs_argv[6] = {"mkfs.f2fs", "-t1"};
             if (length < 0) {
-                LOGE("format_volume: negative length (%zd) not supported on %s\n", length, v->fs_type);
-                return -1;
-            }
-            char *num_sectors;
-            if (asprintf(&num_sectors, "%zd", length / 512) <= 0) {
-                LOGE("format_volume: failed to create %s command for %s\n", v->fs_type, v->blk_device);
-                return -1;
+                snprintf(bytes_reserved, sizeof(bytes_reserved), "%zd", -length);
+                f2fs_argv[2] = "-r";
+                f2fs_argv[3] = bytes_reserved;
+                f2fs_argv[4] = v->blk_device;
+                f2fs_argv[5] = NULL;
+            } else {
+                /* num_sectors can be zero which mean whole device space */
+                snprintf(num_sectors, sizeof(num_sectors), "%zd", length / 512);
+                f2fs_argv[2] = v->blk_device;
+                f2fs_argv[3] = num_sectors;
+                f2fs_argv[4] = NULL;
             }
             const char *f2fs_path = "/sbin/mkfs.f2fs";
-            const char* const f2fs_argv[] = {"mkfs.f2fs", "-t", "-d1", v->blk_device, num_sectors, NULL};
 
             result = exec_cmd(f2fs_path, (char* const*)f2fs_argv);
-            free(num_sectors);
         }
         if (result != 0) {
             LOGE("format_volume: make %s failed on %s with %d(%s)\n", v->fs_type, v->blk_device, result, strerror(errno));
@@ -397,8 +674,8 @@ int format_volume(const char* volume, const char* directory) {
     return -1;
 }
 
-int format_volume(const char* volume) {
-    return format_volume(volume, NULL);
+int format_volume(const char* volume, bool force) {
+    return format_volume(volume, NULL, force);
 }
 
 int setup_install_mounts() {

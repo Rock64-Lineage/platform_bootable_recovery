@@ -33,15 +33,26 @@ LOCAL_CLANG := true
 
 LOCAL_SRC_FILES := $(updater_src_files)
 
-LOCAL_STATIC_LIBRARIES += libfec libfec_rs libext4_utils_static libsquashfs_utils libcrypto_static librk_emmcutils libfs_mgr
+LOCAL_STATIC_LIBRARIES += libfec \
+    libfec_rs \
+    libext4_utils_static \
+    libsquashfs_utils \
+    libcrypto_utils_static \
+    libcrypto_static \
+    librk_emmcutils  \
+    libfs_mgr
 
-ifeq ($(TARGET_USERIMAGES_USE_EXT4), true)
-LOCAL_CFLAGS += -DUSE_EXT4
 LOCAL_CFLAGS += -Wno-unused-parameter
 LOCAL_C_INCLUDES += system/extras/ext4_utils
 LOCAL_STATIC_LIBRARIES += \
     libsparse_static \
     libz
+
+LOCAL_C_INCLUDES += external/e2fsprogs/lib
+LOCAL_STATIC_LIBRARIES += libext2_blkid libext2_uuid
+
+ifeq ($(BOARD_SUPPRESS_EMMC_WIPE),true)
+    LOCAL_CFLAGS += -DSUPPRESS_EMMC_WIPE
 endif
 
 LOCAL_STATIC_LIBRARIES += $(TARGET_RECOVERY_UPDATER_LIBS) $(TARGET_RECOVERY_UPDATER_EXTRA_LIBS)

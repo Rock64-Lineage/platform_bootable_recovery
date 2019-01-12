@@ -40,6 +40,7 @@
 #include "minui/minui.h"
 #include "screen_ui.h"
 #include "ui.h"
+#include "cutils/properties.h"
 
 #define TEXT_INDENT     4
 
@@ -79,7 +80,9 @@ ScreenRecoveryUI::ScreenRecoveryUI() :
     stage(-1),
     max_stage(-1),
     updateMutex(PTHREAD_MUTEX_INITIALIZER),
-    rtl_locale(false) {
+    rtl_locale(false),
+    rainbow(false),
+    wrap_count(0) {
 }
 
 GRSurface* ScreenRecoveryUI::GetCurrentFrame() {
@@ -175,6 +178,8 @@ void ScreenRecoveryUI::draw_background_locked() {
 // Should only be called with updateMutex locked.
 void ScreenRecoveryUI::draw_foreground_locked() {
     if (currentIcon != NONE) {
+        gr_color(0, 0, 0, 255);
+        gr_clear();
         GRSurface* frame = GetCurrentFrame();
         int frame_width = gr_get_width(frame);
         int frame_height = gr_get_height(frame);
@@ -231,13 +236,13 @@ void ScreenRecoveryUI::SetColor(UIElement e) {
             break;
         case MENU:
         case MENU_SEL_BG:
-            gr_color(0, 106, 157, 255);
+            gr_color(106, 103, 102, 255);
             break;
         case MENU_SEL_BG_ACTIVE:
-            gr_color(0, 156, 100, 255);
+            gr_color(138, 135, 134, 255);
             break;
         case MENU_SEL_FG:
-            gr_color(255, 255, 255, 255);
+            gr_color(0, 177, 229, 255);
             break;
         case LOG:
             gr_color(196, 196, 196, 255);
@@ -368,6 +373,13 @@ void* ScreenRecoveryUI::ProgressThreadStartRoutine(void* data) {
     return nullptr;
 }
 
+void ScreenRecoveryUI::OMGRainbows()
+{
+    rainbow = rainbow ? false : true;
+    set_rainbow_mode(rainbow);
+    property_set("sys.rainbow.recovery", rainbow ? "1" : "0");
+}
+
 void ScreenRecoveryUI::ProgressThreadLoop() {
     double interval = 1.0 / animation_fps;
     while (true) {
@@ -378,7 +390,7 @@ void ScreenRecoveryUI::ProgressThreadLoop() {
 
         // update the installation animation, if active
         // skip this if we have a text overlay (too expensive to update)
-        if ((currentIcon == INSTALLING_UPDATE || currentIcon == ERASING) && !show_text) {
+        if ((currentIcon == INSTALLING_UPDATE || currentIcon == ERASING)) {
             if (!intro_done) {
                 if (current_frame == intro_frames - 1) {
                     intro_done = true;
@@ -408,11 +420,16 @@ void ScreenRecoveryUI::ProgressThreadLoop() {
         if (redraw) update_progress_locked();
 
         pthread_mutex_unlock(&updateMutex);
+
+        if (progressBarType == EMPTY)
+            break;
+
         double end = now();
         // minimum of 20ms delay between frames
         double delay = interval - (end-start);
         if (delay < 0.02) delay = 0.02;
         usleep((long)(delay * 1000000));
+
     }
 }
 
@@ -492,8 +509,6 @@ void ScreenRecoveryUI::Init() {
     LoadLocalizedBitmap("error_text", &error_text);
 
     LoadAnimation();
-
-    pthread_create(&progress_thread_, nullptr, ProgressThreadStartRoutine, this);
 }
 
 void ScreenRecoveryUI::LoadAnimation() {
@@ -571,6 +586,9 @@ void ScreenRecoveryUI::SetProgressType(ProgressType type) {
     pthread_mutex_lock(&updateMutex);
     if (progressBarType != type) {
         progressBarType = type;
+        if (progressBarType != EMPTY) {
+            pthread_create(&progress_thread_, nullptr, ProgressThreadStartRoutine, this);
+        }
     }
     progressScopeStart = 0;
     progressScopeSize = 0;
@@ -770,16 +788,40 @@ void ScreenRecoveryUI::StartMenu(const char* const * headers, const char* const 
 }
 
 int ScreenRecoveryUI::SelectMenu(int sel) {
+    int wrapped = 0;
     pthread_mutex_lock(&updateMutex);
     if (show_menu) {
         int old_sel = menu_sel;
         menu_sel = sel;
 
         // Wrap at top and bottom.
-        if (menu_sel < 0) menu_sel = menu_items - 1;
-        if (menu_sel >= menu_items) menu_sel = 0;
-
+        if (rainbow) {
+            if (menu_sel > old_sel) {
+                move_rainbow(1);
+            } else if (menu_sel < old_sel) {
+                move_rainbow(-1);
+            }
+        }
+        if (menu_sel < 0) {
+            wrapped = -1;
+            menu_sel = menu_items - 1;
+        }
+        if (menu_sel >= menu_items) {
+            wrapped = 1;
+            menu_sel = 0;
+        }
         sel = menu_sel;
+        if (wrapped != 0) {
+            if (wrap_count / wrapped > 0) {
+                wrap_count += wrapped;
+            } else {
+                wrap_count = wrapped;
+            }
+            if (wrap_count / wrapped >= 5) {
+                wrap_count = 0;
+                OMGRainbows();
+            }
+        }
         if (menu_sel != old_sel) update_screen_locked();
     }
     pthread_mutex_unlock(&updateMutex);
@@ -790,7 +832,6 @@ void ScreenRecoveryUI::EndMenu() {
     pthread_mutex_lock(&updateMutex);
     if (show_menu && text_rows_ > 0 && text_cols_ > 0) {
         show_menu = false;
-        update_screen_locked();
     }
     pthread_mutex_unlock(&updateMutex);
 }
